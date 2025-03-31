@@ -334,7 +334,6 @@ getReactomePthLevelDF <- function(){
   return(pth_level_ids)
 }
 
-
 getReactome <- function(de.results.df){
   
   #' Generate Reactome Pathway Data for Differential Gene Expression Analysis
