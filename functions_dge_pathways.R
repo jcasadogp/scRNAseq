@@ -1,279 +1,3 @@
-####### fgsea function used for pathway analysis (to be moved to a separate script in a final code version) #######
-performGSEAmultilevel <- function(markers, fgsea.set, metric = "auc", cluster, n.lines = 10, minS, maxS, sSize = 101, gseaParam = 1, scoreType = "pos", eps = 1*10^-10, coll.path = FALSE, analysis.name) {
-  
-  ## Perform Gene Set Enrichment Analysis with fgsea package using fgseaMultilevel function and write results.
-  ## Function inputs:
-  #' @param markers Table containing all DE genes.
-  #' @param fgsea.set Dataset used for fgsea (MSigDb or Reactome).
-  #' @param metric Metric options for gene ranking (auc or sign(logFC)*(-log10(padj))).
-  #' @param cluster Single-cell cluster used for subsetting markers table.
-  #' @param n.lines Number of top pathways in the output.
-  #' @param minS  Minimal size of a gene set to test.
-  #' @param maxS Maximal size of a gene set to test.
-  #' @param sSize The size of a random set of genes which in turn has size = pathwaySize.
-  #' @param gseaParam GSEA parameter value, all gene-level statistics are raised to the power of 'gseaParam' before calculation of GSEA enrichment scores.
-  #' @param scoreType This parameter defines the GSEA score type. Possible options are (std, pos, neg).
-  #' @param eps This parameter sets the boundary for calculating the p value.
-  #' @param coll.path Collapse list of enriched pathways to independent ones.
-  #' @param analysis.name The name of the analysis used for naming outputs.
-  
-  # Rank genes in each cluster based on the selected metric 
-  # (auc metric or sign(markers$logFC)*(-log10(markers$padj)) can be used for gene ranking)
-  if (metric == "auc") {
-    clstr.genes <-
-      markers %>%
-      dplyr::filter(group == as.integer(cluster)) %>%
-      arrange(desc(auc)) %>%
-      dplyr::select(feature, auc)
-  } else {
-    markers$padj[markers$padj == 0] <- 2e-230
-    markers$pval[markers$pval == 0] <- 2e-230
-    fcSign <- sign(markers$logFC) * (-log10(markers$padj))
-    markers$metric2 <- fcSign
-    
-    clstr.genes <-
-      markers %>%
-      dplyr::filter(group == as.integer(cluster)) %>%
-      arrange(desc(metric2)) %>%
-      dplyr::select(feature, metric2)
-  }
-  rnks <- deframe(clstr.genes)
-  
-  # Run the GSEA function (fgseaMultilevel)
-  fgsea.res <- fgsea(fgsea.set, rnks, minSize = minS, maxSize = maxS, sampleSize = sSize, gseaParam = gseaParam, scoreType = scoreType, eps = eps, nproc = 1)
-  
-  # Sort the results by descending order of Normalized Enrichment Score (NES) and adjusted p-value
-  fgsea.res.tidy <-
-    fgsea.res %>%
-    as_tibble() %>%
-    arrange(desc(NES)) %>%
-    dplyr::select(-leadingEdge, -ES, -log2err) %>%
-    arrange(padj) %>%
-    head(n = n.lines)
-  
-  # Write top n pathways from each cluster into one file
-  fgsea.res.tidy$cluster_id <- rep(cluster, nrow(fgsea.res.tidy))
-  
-  all_clusters_file <- paste0("~/Results/", analysis.name, "_Result.allClusters.tsv")
-  if (file.exists(all_clusters_file)) {
-    write.table(fgsea.res.tidy,
-                file = all_clusters_file, append = TRUE, sep = "\t",
-                row.names = FALSE, col.names=FALSE, quote = FALSE
-    )
-  } else{
-    write.table(fgsea.res.tidy,
-                file = all_clusters_file, append = TRUE, sep = "\t",
-                row.names = FALSE, col.names=TRUE, quote = FALSE
-    )
-  }
-  
-  # Collapse pathways if the option is selected, and select the main pathways
-  if (coll.path) {
-    collapsed.pathways <- collapsePathways(
-      fgsea.res[order(pval)][padj < 0.01],
-      fgsea.set, rnks
-    )
-    main.pathways <- fgsea.res[pathway %in% collapsed.pathways$mainPathways] %>%
-      arrange(desc(NES)) %>%
-      dplyr::select(-leadingEdge)
-  } else {
-    main.pathways <- fgsea.res %>%
-      arrange(desc(NES)) %>%
-      dplyr::select(-leadingEdge)
-  }
-  
-  # Write pathways for each cluster in a separate TSV file  (all pathways are included)
-  write.table(main.pathways, file = paste0("~/Results/", analysis.name, "_Pathways.cluster_", cluster, ".tsv"),
-              quote = FALSE, sep = "\t")
-}
-
-safePseudoBulkDGE <- function(sce_aggregated, label, coef, condition, group1, group2){
-  #' This function is wraper around pseudoBulkDGE function. This function handles cases when all data is coming from the same batch
-  #' or when batch equals sample.
-  #'
-  #' Removes suffix, characters that follow '.' in gene IDs.
-  #'
-  #' @param sce_aggregated Agregated single cell experiment object.
-  #' @param label Cluster name.
-  #' @param coef Name of condition 2 plus value.
-  #' @param condition Condition metadata field name.
-  #' @param group1 Name of group(condition) 1 for pseudobulk DE.
-  #' @param group2 Name of group(condition) 2 for pseudobulk DE.
-  
-  batch_equals_condition <- (adjustedRandIndex(sce_aggregated$batch,sce_aggregated$condition) >= 1)
-  batch_equals_sample <- (adjustedRandIndex(sce_aggregated$batch,sce_aggregated$sample) >= 1)
-  
-  # handle possible NaN values
-  if(is.na(batch_equals_condition)){
-    batch_equals_condition <- TRUE
-  }
-  
-  if(is.na(batch_equals_sample)){
-    batch_equals_sample <- TRUE
-  }
-  
-  if(length(unique(sce_aggregated$batch))>1 & !batch_equals_condition & !batch_equals_sample){
-    
-    current_de_results <- pseudoBulkDGE(
-      sce_aggregated, 
-      label= label,
-      design= ~factor(batch) + condition,
-      coef=paste0("condition", group2),
-      condition=sce_aggregated$condition
-    )
-  } else{
-    
-    if(length(unique(sce_aggregated$batch))==1){
-      message("Batch metadata field contains only one value and is excluded from design")
-    }
-    if(batch_equals_condition){
-      message("Batch contains exact same information as condition, therefore batch info is not used during DE analysis")
-    }
-    
-    if(batch_equals_sample){
-      message("Warning: batch information is identical to sample information, therefore batch info is not used during DE analysis")
-    }
-    
-    current_de_results <- pseudoBulkDGE(
-      sce_aggregated, 
-      label= label,
-      design= ~condition,
-      coef=paste0("condition", group2),
-      condition=sce_aggregated$condition
-    )
-  }
-  return(current_de_results)
-}
-
-############################  DGE FUNCTIONS ############################
-
-writeToNestedList <- function(in_list, cluster_name, group1_name, group2_name, value){
-  #' This function is used for storing of DE metrics data. Data is stored in nested list format
-  #' by cluster, group1 and group2.
-  #'
-  #' Removes suffix, characters that follow '.' in gene IDs.
-  #'
-  #' @param in_list List where to write results.
-  #' @param cluster_name Cluster name for cluster that is used for differential expression
-  #' @param group1_name Group(condition) 1 for DE
-  #' @param group2_name Group(condition) 2 for DE
-  #' @param value Value that will be written to the list.
-  
-  group1_name <- toString(group1_name)
-  group2_name <- toString(group2_name)
-  
-  if(!cluster_name %in% names(in_list)){
-    in_list[[cluster_name]] <- list()
-  }
-  if(!group1_name %in% names(in_list[[cluster_name]])){
-    in_list[[cluster_name]][[group1_name]] <- list()
-  }
-  
-  if(!group2_name %in% names(in_list[[cluster_name]][[group1_name]])){
-    in_list[[cluster_name]][[group1_name]][[group2_name]] <- value
-  }else(
-    print("ERROR, this value already exists")
-  )
-  
-  return(in_list)
-}
-
-getGeneExpression <- function(sample.seurat, gene_name){
-  #' Get Gene Expression Data for Specified Gene
-  #'
-  #' This function retrieves gene expression data for a specified gene from a Seurat object, 
-  #' and computes the number of cells expressing or not expressing the gene, along with selected metadata information.
-  #' It returns a summary data frame with counts for positive and negative cells, grouped by metadata fields.
-  #'
-  #' @param sample.seurat A Seurat object containing the gene expression data and metadata.
-  #' @param gene_name A character string specifying the gene for which the expression data should be retrieved.
-  #'
-  #' @return A data frame with the following columns:
-  #' \item{Donor}{The donor identifier from metadata.}
-  #' \item{FDS}{The FDS field from metadata.}
-  #' \item{Treatment}{The treatment field from metadata.}
-  #' \item{positive_cells}{The count of cells with non-zero expression for the specified gene.}
-  #' \item{negative_cells}{The count of cells with zero expression for the specified gene.}
-  #' \item{total_cells}{The total number of cells (positive + negative).}
-  #' \item{Percentage}{The percentage of positive cells relative to the total cells.}
-  #'
-  #' If the specified gene is not found in the counts matrix, the function returns an empty data frame.
-  
-  metadata_fields <- c("donor_id", "FDS", "treatment")
-  
-  # Check if gene_name exists in the counts matrix
-  if (!(gene_name %in% rownames(sample.seurat@assays[[assay_name]]$counts))) {
-    
-    cat(paste0(gene_name, " is not in rownames of Seurat"), sep = "\n")
-    
-    # If gene_name doesn't exist, return an empty data frame
-    gene_expression <- data.frame(Donor = character(),
-                                  FDS = character(),
-                                  Treatment = character(),
-                                  Timepoint = character(),
-                                  positive_cells = integer(),
-                                  negative_cells = integer())
-    
-    return(gene_expression)
-  }
-  
-  cat(paste0(gene_name, " is in rownames of Seurat"), sep = "\n")
-  
-  gene_positive_counts <- GetAssayData(sample.seurat, layer = "counts")[gene_name, ]
-  gene_positive_counts <- gene_positive_counts[gene_positive_counts != 0]
-  gene_positive_cell_names <- rownames(as.data.frame(gene_positive_counts))
-  gene_positive_metadata <- sample.seurat@meta.data[gene_positive_cell_names,]
-  
-  gene_negative_cell_names <- setdiff(colnames(sample.seurat), gene_positive_cell_names)
-  gene_negative_counts <- sample.seurat@assays[[assay_name]]$counts[gene_name,gene_negative_cell_names]
-  gene_negative_metadata <- sample.seurat@meta.data[gene_negative_cell_names,]
-  
-  gene_negative_cells <- as.data.frame(table(gene_negative_metadata[,metadata_fields]))
-  colnames(gene_negative_cells) <- c("Donor", "FDS", "Treatment", "negative_cells")
-  
-  if(length(gene_positive_cell_names) > 1) {
-    gene_positive_cells <- as.data.frame(table(gene_positive_metadata[,metadata_fields]))
-    colnames(gene_positive_cells) <- c("Donor", "FDS", "Treatment", "positive_cells")
-    gene_expression <- merge(gene_negative_cells, gene_positive_cells, by = c("Donor", "FDS", "Treatment"), all = TRUE)
-    gene_expression[is.na(gene_expression)] <- 0 # replace NA with 0
-  } else {
-    gene_expression <- gene_negative_cells
-    gene_expression$positive_cells = 0
-  }
-  
-  gene_expression <- gene_expression[gene_expression$negative_cells != 0 | gene_expression$positive_cells != 0, ]
-  gene_expression$total_cells <- gene_expression$positive_cells + gene_expression$negative_cells
-  gene_expression$Percentage <- gene_expression$positive_cells*100 / gene_expression$total_cells
-  
-  return(gene_expression)
-}
-
-getExpressionData <- function(object, gene_list, metadata_fields){
-  #' Get Expression Data for Specified Genes and Metadata
-  #'
-  #' This function retrieves the expression data for a specified list of genes, along with selected metadata fields, 
-  #' from a Seurat object. The data is then merged by cell identifiers (Cell).
-  #'
-  #' @param object A Seurat object containing expression data and metadata.
-  #' @param gene_list A vector of gene names to retrieve expression data for.
-  #' @param metadata_fields A character vector containing the names of the metadata fields to include in the final data.
-  #'
-  #' @return A data frame with the expression data for the specified genes, along with the selected metadata fields.
-  #' The data is merged by the "Cell" column, which identifies the cells.
-  
-  expression_data <- GetAssayData(object, layer = "counts")[gene_list, ]
-  expression_data <- t(as.data.frame(expression_data))
-  expression_data <- cbind(expression_data, rownames(expression_data))
-  rownames(expression_data) <- NULL
-  colnames(expression_data)[length(colnames(expression_data))] <- "Cell"
-  
-  metadata <- as.data.frame(sample.seurat@meta.data)
-  metadata <- cbind(metadata, rownames(metadata))
-  colnames(metadata)[length(colnames(metadata))] <- "Cell"
-  
-  data_combined <- merge(expression_data, metadata[,c(metadata_fields, "Cell")], by="Cell")
-}
-
 plotDGEVolcano <- function(de.results.df, label_genes, variable_name, x, y, title, filename = NULL){
   
   ## Plots the DGE Volcano Plot
@@ -298,10 +22,11 @@ plotDGEVolcano <- function(de.results.df, label_genes, variable_name, x, y, titl
                                  subtitle = NULL,
                                  pCutoff = 0.05,
                                  FCcutoff = 2,
-                                 drawConnectors = TRUE)
+                                 drawConnectors = TRUE,
+                                 max.overlaps = Inf)
   
   if(!is.null(filename)){
-    ggsave(filename, volcanoPlot, device = "png", width = 8, height = 5.5, units = "in", dpi = 300) 
+    ggsave(filename, volcanoPlot, device = "png", width = 7, height = 6, units = "in", dpi = 300) 
   } else {
     return(volcanoPlot) 
   }
@@ -323,7 +48,7 @@ getReactomePthLevelDF <- function(){
   cat("---- Remember to check if Reactome has newer versions of the pathway level files!\n", sep = "")
   
   # Check if newer version: https://reactome.org/download-data
-  pth_level_ids <- read.table("~/InputData/Reactome_Files/Complex_2_Pathway_human.txt", header = TRUE)
+  pth_level_ids <- read.table("~/Data/Reactome_Files/Complex_2_Pathway_human.txt", header = TRUE)
   
   pth_level_ids <- pth_level_ids %>% 
     dplyr::select(pathway, top_level_pathway) %>%
@@ -334,7 +59,33 @@ getReactomePthLevelDF <- function(){
   return(pth_level_ids)
 }
 
-getReactome <- function(de.results.df){
+addManualPathwayLevels <- function(df) {
+  
+  # Check and install openxlsx if needed
+  if (!requireNamespace("openxlsx", quietly = TRUE)) {
+    cat("Installing required package 'openxlsx'...\n")
+    install.packages("openxlsx")
+  }
+  
+  # Load the package
+  library(openxlsx)
+  
+  manual <- read.xlsx("~/Data/Reactome_Files/manual_categories_excel.xlsx", sheet = "all", colNames = TRUE) %>%
+    dplyr::filter(pathway_level != "NONE") %>%
+    dplyr::select(pathway, pathway_level)
+  manual$pathway <- gsub("\u00A0", " ", manual$pathway)
+  
+  result_df <- df %>% left_join(manual, by = "pathway", relationship = "many-to-many") 
+  
+  result_df$pathway_level <- ifelse(is.na(result_df$pathway_level.x), 
+                                    result_df$pathway_level.y, 
+                                    result_df$pathway_level.x)
+  result_df <- result_df %>% dplyr::select(-pathway_level.x, -pathway_level.y)
+  
+  return(result_df)
+}
+
+getReactome <- function(de.results.df, rank_metric = NULL){
   
   #' Generate Reactome Pathway Data for Differential Gene Expression Analysis
   #'
@@ -357,20 +108,20 @@ getReactome <- function(de.results.df){
   #' \item{collapsed.Pathways.React}{A list of collapsed Reactome pathways, aggregating related pathways.}
   #' \item{main.pathways}{A list of main pathways that are included in the collapsed pathways.}
   
-  source("~/InputData/Reactome_Files/reactome_variables.R")
+  source("~/Data/Reactome_Files/reactome_variables.R")
   
-  cat("1/10 => Check if Reactome and AnnotationDbi packages are loaded\n", sep = "")
+  cat("- 1/11 => Check if Reactome and AnnotationDbi packages are loaded\n", sep = "")
   
   stopifnot(requireNamespace("reactome.db"))
   stopifnot(requireNamespace("AnnotationDbi"))
   
-  tic("Pathway analysis - Reactome DB")
+  # tic("Pathway analysis - Reactome DB")
   
   all_react_list <- list()
   main_react_list <- list()
   parent_react_list <- list()
   
-  cat("2/10 => Load the DB and map out genes to the ENTREZID codes\n", sep = "")
+  cat("- 2/11 => Load the DB and map out genes to the ENTREZID codes\n", sep = "")
   
   entrez.db <- org.Hs.eg.db
   g.entrezid <- mapIds(entrez.db,
@@ -381,7 +132,7 @@ getReactome <- function(de.results.df){
   de.results.df$feature <- g.entrezid
   genes <- unique(g.entrezid)
   
-  cat("3/10 => Calculate pathway levels\n", sep = "")
+  cat("- 3/11 => Calculate pathway levels\n", sep = "")
   
   ### The following code substitutes reactomePathways(unique(g.entrezid))
   ### fgsea.set.React <- reactomePathways(unique(g.entrezid))
@@ -396,43 +147,51 @@ getReactome <- function(de.results.df){
   
   PATHNAME <- NULL
   pathway2name[, `:=`(PATHNAME, sub("^[^:]*: ", "", PATHNAME))]
+  ## There are duplicates in pathway2name: same PATHNAME with different PATHID
   
   # Add pathway category
-  # pth_level_ids <- read.table("~/InputData/Reactome_Files/pathway_level_ids_good.tsv", header = TRUE)
   pth_level_ids <- getReactomePthLevelDF()
-  pth_with_level <- unique(merge(pathway2name, pth_level_ids, by = "PATHID", all.x = TRUE))
+  pathway2name_with_level <- unique(merge(pathway2name, pth_level_ids, by = "PATHID", all.x = TRUE))
+  ## Consequently, there are duplicates in pathway2name_with_level: same PATHNAME with different PATHID and hence, different LEVELID
   
-  pth_with_level$LEVELID <- ifelse(
-    is.na(pth_with_level$LEVELID) & pth_with_level$PATHID %in% pth_level_ids$LEVELID,
-    pth_with_level$PATHID, 
-    pth_with_level$LEVELID
+  pathway2name_with_level$LEVELID <- ifelse(
+    is.na(pathway2name_with_level$LEVELID) & pathway2name_with_level$PATHID %in% pth_level_ids$LEVELID,
+    pathway2name_with_level$PATHID, 
+    pathway2name_with_level$LEVELID
   )
+  ## Consequently, there are duplicates in pathway2name_with_level: same PATHNAME with different PATHID and hence, different LEVELID
   
-  pth_with_level$LEVELNAME <- levelname_assignments[pth_with_level$LEVELID]
+  pathway2name_with_level$LEVELNAME <- levelname_assignments[pathway2name_with_level$LEVELID]
+  pathway2name_with_level$PATHNAME <- gsub("\u00A0", " ", pathway2name_with_level$PATHNAME)
   
-  sum(!complete.cases(pth_with_level))
-  # There are 770 pathways without top level pathway
-  # pth_without_level <- pth_with_level[!complete.cases(pth_with_level),]
+  ## END ##
   
   name2pathways <- split(pathway2name$PATHID, pathway2name$PATHNAME)
   pathways_fun <- lapply(name2pathways, function(x) unique(do.call(c, pathways_fun[x])))
   fgsea.set.React <- pathways_fun[!is.na(names(pathways_fun))]
   ## ****************************************************************************************************
   
-  cat("4/10 => Generate the Ranked Gene List\n", sep = "")
+  cat("- 4/11 => Generate the Ranked Gene List\n", sep = "")
   # create a sorted list based on gene ranks
   gene_list <- de.results.df
-  gene_list$PValue <- ifelse(gene_list$PValue == 0, 1e-100, gene_list$PValue)
-  gene_list$fcsign <- sign(gene_list$logFC)
-  gene_list$logP <- -log10(gene_list$PValue)
-  gene_list$metric <- gene_list$logP/gene_list$fcsign
+  if(is.null(rank_metric)) {
+    gene_list$PValue <- ifelse(gene_list$PValue == 0, 1e-100, gene_list$PValue)
+    gene_list$fcsign <- sign(gene_list$logFC)
+    gene_list$logP <- -log10(gene_list$PValue)
+    # gene_list$metric <- gene_list$logP/gene_list$fcsign
+    # multiplying instead of dividing does not give error in case logFC = 0 => fcsign = 0 (0 in denominator)
+    gene_list$metric <- gene_list$logP * gene_list$fcsign
+  } else {
+    colnames(gene_list)[colnames(gene_list) == rank_metric] <- "metric"
+    gene_list <- gene_list %>% arrange(desc(metric))
+  }
   
-  cat("5/10 => Prepare list of genes for fgsea with Reactome\n", sep = "")
+  cat("- 5/11 => Prepare list of genes for fgsea with Reactome\n", sep = "")
   final.React <- gene_list[,c("feature", "metric")]
   final.React <- na.omit(final.React[order(final.React$metric),])
   final.React <- deframe(final.React)
   
-  cat("6/10 => Perform pathway analysis -> fgsea.res.React\n", sep = "")
+  cat("- 6/11 => Perform pathway analysis -> fgsea.res.React\n", sep = "")
   suppressWarnings(
     fgsea.res.React <- fgsea(pathways=fgsea.set.React,
                              stats=final.React,
@@ -441,13 +200,13 @@ getReactome <- function(de.results.df){
                              nproc=1)
   )
   
-  cat("7/10 => Sort, select desired columns and filter by leadingEdge>0 -> fgsea.res.tidy.React.filtered\n", sep = "")
+  cat("- 7/11 => Sort, select desired columns and filter by leadingEdge>0 -> fgsea.res.tidy.React.filtered\n", sep = "")
   fgsea.res.tidy.React <- fgsea.res.React %>% arrange(desc(NES)) %>% dplyr::select(-ES, -log2err)
   fgsea.res.tidy.React.filtered <- fgsea.res.tidy.React[ sapply(fgsea.res.tidy.React$leadingEdge, length) > 0 ]
   
   nrows_filtered <- nrow(fgsea.res.tidy.React) - nrow(fgsea.res.tidy.React.filtered)
   
-  cat("8/10 => Map leadingEdge genes back to gene names -> fgsea.res.tidy.React.filtered\n", sep = "")
+  cat("- 8/11 => Map leadingEdge genes back to gene names -> fgsea.res.tidy.React.filtered\n", sep = "")
   fgsea.res.tidy.React.filtered$leadingEdge <- mapIdsList(entrez.db,
                                                           keys=fgsea.res.tidy.React.filtered$leadingEdge,
                                                           keytype="ENTREZID",
@@ -455,7 +214,7 @@ getReactome <- function(de.results.df){
   
   fgsea.res.tidy.React.filtered$leadingEdge <- as.character(lapply(fgsea.res.tidy.React.filtered$leadingEdge, toString))
   
-  cat("9/10 => Find collapsed pathways: main and parent -> collapsed.Pathways.React\n", sep = "")
+  cat("- 9/11 => Find collapsed pathways: main and parent -> collapsed.Pathways.React\n", sep = "")
   suppressWarnings(
     collapsed.Pathways.React <- collapsePathways(fgsea.res.React[order(pval)][pval < 0.01],
                                                  fgsea.set.React, final.React)
@@ -464,30 +223,41 @@ getReactome <- function(de.results.df){
   main.pathways <- fgsea.res.tidy.React.filtered[fgsea.res.tidy.React.filtered$pathway %in% collapsed.Pathways.React$mainPathways,]
   parent.pathways <- fgsea.res.tidy.React.filtered[fgsea.res.tidy.React.filtered$pathway %in% collapsed.Pathways.React$parentPathways,]
   
-  cat("10/10 => Add pathway levels\n", sep = "")
-  fgsea.res.tidy.React <- merge(fgsea.res.tidy.React, pth_with_level[, .(PATHNAME, LEVELNAME)], by.x = "pathway", by.y = "PATHNAME", all.x = TRUE)
+  cat("- 10/11 => Add pathway levels\n", sep = "")
+  
+  # Before the merge operations at the end, add:
+  fgsea.res.tidy.React$pathway <- gsub("\u00A0", " ", fgsea.res.tidy.React$pathway)
+  main.pathways$pathway <- gsub("\u00A0", " ", main.pathways$pathway)
+  parent.pathways$pathway <- gsub("\u00A0", " ", parent.pathways$pathway)
+  
+  # Merge
+  fgsea.res.tidy.React <- merge(fgsea.res.tidy.React, unique(pathway2name_with_level[, .(PATHNAME, LEVELNAME)]), by.x = "pathway", by.y = "PATHNAME", all.x = TRUE)
   names(fgsea.res.tidy.React)[names(fgsea.res.tidy.React) == "LEVELNAME"] <- "pathway_level"
   
-  main.pathways <- merge(main.pathways, pth_with_level[, .(PATHNAME, LEVELNAME)], by.x = "pathway", by.y = "PATHNAME", all.x = TRUE)
+  main.pathways <- merge(main.pathways, unique(pathway2name_with_level[, .(PATHNAME, LEVELNAME)]), by.x = "pathway", by.y = "PATHNAME", all.x = TRUE)
   names(main.pathways)[names(main.pathways) == "LEVELNAME"] <- "pathway_level"
   
-  parent.pathways <- merge(parent.pathways, pth_with_level[, .(PATHNAME, LEVELNAME)], by.x = "pathway", by.y = "PATHNAME", all.x = TRUE)
+  parent.pathways <- merge(parent.pathways, unique(pathway2name_with_level[, .(PATHNAME, LEVELNAME)]), by.x = "pathway", by.y = "PATHNAME", all.x = TRUE)
   names(parent.pathways)[names(parent.pathways) == "LEVELNAME"] <- "pathway_level"
   
+  cat("- 11/11 => Add manual pathway levels in the Excel file\n", sep = "")
+  fgsea.res.tidy.React <- addManualPathwayLevels(fgsea.res.tidy.React)
+  main.pathways <- addManualPathwayLevels(main.pathways)
+  parent.pathways <- addManualPathwayLevels(parent.pathways)
   
+  # Save into list
   all_react_list[["Reactome"]] <- fgsea.res.tidy.React
   main_react_list[["Reactome"]] <- main.pathways
   parent_react_list[["Reactome"]] <- parent.pathways
   
-  toc()
+  # toc()
   
   return(list(all_react_list = all_react_list, 
               main_react_list = main_react_list, 
               parent_react_list = parent_react_list))
 }
 
-getMSigDbPathways <- function(de.results.df){
-  
+getMSigDbPathways <- function(de.results.df, database, rank_metric = NULL){
   #' Generate MSigDB Pathway Data for Differential Gene Expression Analysis
   #'
   #' This function processes differential gene expression (DGE) results to generate 
@@ -506,64 +276,67 @@ getMSigDbPathways <- function(de.results.df){
   #' \item{fgsea.res}{A data frame of MSigDB pathway results, including pathway names, p-values, NES values, and leading edge genes.}
   #' \item{fgsea.res.tidy}{A tidied version of the MSigDB pathway results, sorted by NES, excluding pathways without any genes.}
   
-  tic("Pathway analysis - MSigDB C2 and Hallmarks")
-  
-  # Read Entrez IDs from the Ensembl database
-  symbol.db <- EnsDb.Hsapiens.v86
-  
-  msig.df <- list()
-  msig.df[["C2"]] <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = 'CP')
-  msig.df[["H"]] <- msigdbr(species = "Homo sapiens", category = "H")
+  # tic("Pathway analysis - MSigDB C2 and Hallmarks")
   
   all_msigdb_list <- list()
   main_msigdb_list <- list()
   parent_msigdb_list <- list()
   
-  for(db in names(msig.df)){
-    
-    cat (paste("=>", db), sep = "\n")
-    fgsea.set <- msig.df[[db]] %>% split(x = .$gene_symbol, f = .$gs_name)
-    
-    gene_list <- de.results.df
-    
-    # calculate metrics for ranking genes
+  cat("- 1/6 => Load the DB and map out genes to the ENTREZID codes\n", sep = "")
+  symbol.db <- EnsDb.Hsapiens.v86
+  msig.df <- list()
+  
+  if(database == "C2") {
+    msig.df[["C2"]] <- msigdbr(species = "Homo sapiens", collection = "C2", subcollection = "CP")
+  } else if(database == "H") {
+    msig.df[["H"]] <- msigdbr(species = "Homo sapiens", collection = "H")
+  }
+  
+  # fgsea.set <- msig.df[[database]] %>% split(x = .$gene_symbol, f = .$gs_name)
+  fgsea.set <- split(x = msig.df[[database]]$gene_symbol, f = msig.df[[database]]$gs_name)
+  
+  cat("- 2/6 => Generate the Ranked Gene List\n", sep = "")
+  gene_list <- de.results.df
+  if(is.null(rank_metric)) {
     gene_list$PValue <- ifelse(gene_list$PValue == 0, 1e-100, gene_list$PValue)
     gene_list$fcsign <- sign(gene_list$logFC)
     gene_list$logP <- -log10(gene_list$PValue)
     gene_list$metric <- gene_list$logP/gene_list$fcsign
-    
-    # prepare list of genes for fgsea with MSigDb
-    final <- gene_list[,c("gene_name", "metric")]
-    final <- na.omit(final[order(final$metric),])
-    final <- deframe(final)
-    
-    suppressWarnings(
-      fgsea.res <- fgsea(pathways=fgsea.set,
-                         stats=final,
-                         minSize=1, 
-                         maxSize = Inf,
-                         nproc=1)
-    )
-    
-    fgsea.res.tidy <- fgsea.res %>%
-      as_tibble() %>%
-      arrange(desc(NES)) %>%
-      dplyr::select(-leadingEdge, -ES, -log2err)
-    
-    suppressWarnings(
-      collapsed.Pathways <- collapsePathways(fgsea.res[order(pval)][pval < 0.01],
-                                             fgsea.set, final)
-    )
-    
-    main.pathways <- fgsea.res.tidy[fgsea.res.tidy$pathway %in% collapsed.Pathways$mainPathways,]
-    parent.pathways <- fgsea.res.tidy[fgsea.res.tidy$pathway %in% collapsed.Pathways$parentPathways,]
-    
-    all_msigdb_list[[db]] <- fgsea.res.tidy
-    main_msigdb_list[[db]] <- main.pathways
-    parent_msigdb_list[[db]] <- parent.pathways
+  } else {
+    colnames(gene_list)[colnames(gene_list) == rank_metric] <- "metric"
+    gene_list <- gene_list %>% arrange(desc(metric))
   }
   
-  toc()
+  cat("- 3/6 => Prepare list of genes for fgsea with MSigDB\n", sep = "")
+  final <- gene_list[,c("gene_name", "metric")]
+  final <- na.omit(final[order(final$metric),])
+  final <- deframe(final)
+  
+  cat("- 4/6 => Perform pathway analysis -> fgsea.res\n", sep = "")
+  suppressWarnings(
+    fgsea.res <- fgsea(pathways=fgsea.set,
+                       stats=final,
+                       minSize=1, 
+                       maxSize = Inf,
+                       nproc=1)
+  )
+  
+  cat("- 5/6 => Sort and select desired columns -> fgsea.res.tidy\n", sep = "")
+  fgsea.res.tidy <- fgsea.res %>% as_tibble() %>% arrange(desc(NES)) %>% dplyr::select(-leadingEdge, -ES, -log2err)
+  
+  cat("- 6/6 => Find collapsed pathways: main and parent -> collapsed.Pathways\n", sep = "")
+  suppressWarnings(
+    collapsed.Pathways <- collapsePathways(fgsea.res[order(pval)][pval < 0.01], fgsea.set, final)
+  )
+  
+  main.pathways <- fgsea.res.tidy[fgsea.res.tidy$pathway %in% collapsed.Pathways$mainPathways,]
+  parent.pathways <- fgsea.res.tidy[fgsea.res.tidy$pathway %in% collapsed.Pathways$parentPathways,]
+  
+  all_msigdb_list[[database]] <- fgsea.res.tidy
+  main_msigdb_list[[database]] <- main.pathways
+  parent_msigdb_list[[database]] <- parent.pathways
+  
+  # toc()
   
   return(list(all_msigdb_list = all_msigdb_list, 
               main_msigdb_list = main_msigdb_list, 
@@ -758,66 +531,92 @@ addPathwayCategory <- function(pathways){
   #'   which is a categorical label assigned based on the pathway name. The categories are determined 
   #'   by matching keywords related to various biological processes (e.g., apoptosis, inflammation, immune response, etc.).
   
-  manual_categories = list(
-    "tRNA processing" = "Metabolism of RNA",
-    "Transport of the SLBP independent Mature mRNA" = "Metabolism of RNA",
-    "Transport of Mature mRNAs Derived from Intronless Transcripts" = "Metabolism of RNA",
-    "Metabolism of non-coding RNA" = "Metabolism of RNA",
-    "mRNA decay from 3' to 5' " = "Metabolism of RNA",
-    "Separation of Sister Chromatids" = "Cell Cycle",
-    "Resolution of Sister Chromatid Cohesion" = "Cell Cycle",
-    "DNA strand elongation" = "Cell Cycle",
-    "Deposition of new CENPA-containing nucleosomes at the centromere" = "Cell Cycle",
-    "Activation of the pre-replicative complex" = "Cell Cycle",
-    "PERK regulates gene expression|Response to metal ions" = "Cellular responses to stimuli",
-    "Senescence-Associated Secretory Phenotype (SASP)" = "Cellular responses to stimuli",
-    "Mitochondrial translation termination" = "Metabolism of proteins",
-    "Formation of a pool of free 40S subunits" = "Metabolism of proteins",
-    "Eukaryotic Translation Elongation" = "Metabolism of proteins",
-    "Peptide ligand-binding receptors" = "Signal Transduction",
-    "MAPK1 (ERK2) activation" = "Signal Transduction",
-    "GPCR ligand binding" = "Signal Transduction",
-    "Downregulation of ERBB2 signaling" = "Signal Transduction",
-    "Peptide chain elongation" = "Metabolism of proteins",
-    "Gap junction degradation" = "Vesicle-mediated transport",
-    "PINK1-PRKN Mediated Mitophagy" = "Autophagy"
-  )
-  
-  manual_df <- tibble(
-    pathway = names(manual_categories),
-    manual_category = unlist(manual_categories)
-  )
-  
   pathways <- pathways %>%
-    left_join(manual_df, by = "pathway") %>%
-    mutate(pathway_category = case_when(
-      !is.na(manual_category) ~ manual_category,
-      grepl("SARS-CoV|HIV|APOBEC3G|Leishmania|Disease|Viral|HCMV", pathway, ignore.case = TRUE) ~ "Disease",
-      grepl("immune|antigen|B Cell|BCR|TCR|ER-Phagosome|NK|TLR3|CLEC7A|antibody|NOD1/2 Signaling Pathway|NF-kappa-B|Growth hormone receptor signaling|PKR", pathway, ignore.case = TRUE) ~ "Immune System",
-      grepl("interleukin|IFN|interferon|TNF", pathway, ignore.case = TRUE) ~ "Immune System",
-      grepl("IL", pathway, ignore.case = FALSE) ~ "Immune System",
-      grepl("Developmental Biology", pathway, ignore.case = TRUE) ~ "Developmental Biology",
-      grepl("Chemokine receptors bind chemokines|Signal Transduction|RHO|RND2|NF-kB is activated|GTPase cycle|TGF-beta|relaxin|ERBB4", pathway, ignore.case = TRUE) ~ "Signal Transduction",
-      grepl("glycosilation|deubiquitination|GTP hydrolysis|Translation|codon", pathway, ignore.case = TRUE) ~ "Metabolism of proteins",
-      grepl("vesicle", pathway, ignore.case = TRUE) ~ "Vesicle-mediated transport",
-      grepl("Nicotina|fructuose|fatty acids|SREBP|chondroitin", pathway, ignore.case = TRUE) ~ "Metabolism",
-      grepl("CoA", pathway, ignore.case = FALSE) ~ "Metabolism",
-      grepl("cell cycle|mitosis|G1|G2|mitotic|Synthesis of DNA|meio|checkpoint|chromosome|Telomeres", pathway, ignore.case = TRUE) ~ "Cell Cycle",
-      grepl("chromatin", pathway, ignore.case = TRUE) ~ "Chromatin organization",
-      grepl("stress|death|apoptosis|necrosis|pyroptosis|repair", pathway, ignore.case = TRUE) ~ "DNA Repair",
-      grepl("cellular response|Metallothioneins|(NLR) signaling pathways|chaperone|senescence", pathway, ignore.case = TRUE) ~ "Cellular responses to stimuli",
-      grepl("rRNA|exon", pathway, ignore.case = TRUE) ~ "Metabolism of RNA",
-      grepl("neural", pathway, ignore.case = TRUE) ~ "Neural System",
-      grepl("RNA Polymerase|DNA methylation|RUNX|Transcript", pathway, ignore.case = TRUE) ~ "Gene expression (Transcription)",
-      grepl("plasma", pathway, ignore.case = TRUE) ~ "Transport of small molecules",
-      grepl("ECM|membrane|extracellular|glycoprotein|proteoglycan|collagen|ROBO|kerat|cell surface|cell junction|syndecan|gap junction", pathway, ignore.case = TRUE) ~ "Extracellular matrix organization",
-      grepl("autophagy", pathway, ignore.case = TRUE) ~ "Autophagy",
-      grepl("platelet|PECAM1", pathway, ignore.case = TRUE) ~ "Hemostasis",
-      grepl("Digestion and absorption", pathway, ignore.case = TRUE) ~ "Digestion and absorption",
-      TRUE ~ "Other"
-    )) %>%
-    dplyr::select(-manual_category)
-  
+  mutate(pathway_category = case_when(
+    # Disease
+    grepl("SARS-CoV|HIV|APOBEC3G|Leishmania|Disease|Viral|HCMV|Defective|Disorder|Drug resistance|Mutants|Cancer|Syndrome|Deficiency|Infection|Resistance|Impaired|Loss of function|Defects|Abnormalities|Congenital", pathway, ignore.case = TRUE) ~ "Disease",
+
+    # Immune System
+    grepl("immune|antigen|B Cell|BCR|TCR|ER-Phagosome|NK|TLR3|CLEC7A|antibody|NOD1/2 Signaling Pathway|NF-kappa-B|Growth hormone receptor signaling|PKR|interleukin|IFN|interferon|TNF|IL|Inflammasomes|Neutrophil|Receptors|Cascade", pathway, ignore.case = TRUE) ~ "Immune System",
+
+    # Developmental Biology
+    grepl("Developmental Biology|Cell Lineages|Gastrulation|Transition|Melanocyte", pathway, ignore.case = TRUE) ~ "Developmental Biology",
+
+    # Signal Transduction
+    grepl("Signal Transduction|RHO|RND2|NF-kB is activated|GTPase cycle|TGF-beta|relaxin|ERBB4|GPCR|MAPK|Phosphorylation|GTPase", pathway, ignore.case = TRUE) ~ "Signal Transduction",
+
+    # Metabolism of proteins
+    grepl("glycosilation|deubiquitination|GTP hydrolysis|Translation|codon|Protein|Folding|Ubiquitination|SUMO|N-glycan|O-glycosylation|Processing", pathway, ignore.case = TRUE) ~ "Metabolism of proteins",
+
+    # Vesicle-mediated transport
+    grepl("vesicle|Vesicle-mediated transport|Golgi|ER|Trafficking", pathway, ignore.case = TRUE) ~ "Vesicle-mediated transport",
+
+    # Metabolism
+    grepl("Nicotina|fructuose|fatty acids|SREBP|chondroitin|CoA|Biosynthesis|Catabolism|Synthesis|Acids|Glucose|Glycogen|Lipids|Nucleotide|Vitamin|Oxidations", pathway, ignore.case = TRUE) ~ "Metabolism",
+
+    # Cell Cycle
+    grepl("cell cycle|mitosis|G1|G2|mitotic|Synthesis of DNA|meio|checkpoint|chromosome|Telomeres|Anaphase|Metaphase|Telophase|Cytokinesis", pathway, ignore.case = TRUE) ~ "Cell Cycle",
+
+    # Chromatin organization
+    grepl("chromatin", pathway, ignore.case = TRUE) ~ "Chromatin organization",
+
+    # DNA Repair
+    grepl("repair|DNA Damage|Excision Repair|Mismatch Repair|Break|Homologous Recombination|Resolution", pathway, ignore.case = TRUE) ~ "DNA Repair",
+
+    # Cellular responses to stimuli
+    grepl("cellular response|Metallothioneins|(NLR) signaling pathways|chaperone|senescence|Response|Stress", pathway, ignore.case = TRUE) ~ "Cellular responses to stimuli",
+
+    # Metabolism of RNA
+    grepl("rRNA|mRNA|tRNA|RNA|Metabolism of RNA|Decay|Splicing|Editing|Transport", pathway, ignore.case = TRUE) ~ "Metabolism of RNA",
+
+    # Neuronal System
+    grepl("neural|Neuronal System|Channels|Synapses|Transmission|Potassium|Acetylcholine|GABA", pathway, ignore.case = TRUE) ~ "Neuronal System",
+
+    # Gene expression (Transcription)
+    grepl("RNA Polymerase|DNA methylation|RUNX|Transcript|Gene expression|Transcription|Epigenetic|Activates", pathway, ignore.case = TRUE) ~ "Gene expression (Transcription)",
+
+    # Transport of small molecules
+    grepl("plasma|Transport of small molecules|Transporters|Uptake|Exchange|Lipoprotein|Ion|Sodium|Zinc", pathway, ignore.case = TRUE) ~ "Transport of small molecules",
+
+    # Extracellular matrix organization
+    grepl("ECM|membrane|extracellular|glycoprotein|proteoglycan|collagen|ROBO|kerat|cell surface|cell junction|syndecan|gap junction|Extracellular matrix", pathway, ignore.case = TRUE) ~ "Extracellular matrix organization",
+
+    # Autophagy
+    grepl("autophagy|mitophagy|selective", pathway, ignore.case = TRUE) ~ "Autophagy",
+
+    # Hemostasis
+    grepl("platelet|PECAM1|Clot|Hemostasis|Homeostasis", pathway, ignore.case = TRUE) ~ "Hemostasis",
+
+    # Digestion and absorption
+    grepl("Digestion and absorption|Absorption|Intestinal", pathway, ignore.case = TRUE) ~ "Digestion and absorption",
+
+    # Drug ADME
+    grepl("ADME|Drug", pathway, ignore.case = TRUE) ~ "Drug ADME",
+
+    # Programmed Cell Death
+    grepl("Programmed Cell Death|Cell Death|Apoptosis|Necrosis", pathway, ignore.case = TRUE) ~ "Programmed Cell Death",
+
+    # Sensory Perception
+    grepl("Sensory Perception|Perception|Taste|Sound|Visual|Phototransduction", pathway, ignore.case = TRUE) ~ "Sensory Perception",
+
+    # Circadian Clock
+    grepl("Circadian Clock|Circadian", pathway, ignore.case = TRUE) ~ "Circadian Clock",
+
+    # Organelle biogenesis and maintenance
+    grepl("Biogenesis|Maintenance", pathway, ignore.case = TRUE) ~ "Organelle biogenesis and maintenance",
+
+    # Reproduction
+    grepl("Reproduction|Fertilization", pathway, ignore.case = TRUE) ~ "Reproduction",
+
+    # Muscle contraction
+    grepl("Contraction|Cardiac", pathway, ignore.case = TRUE) ~ "Muscle contraction",
+
+    # Cell-Cell communication
+    grepl("Cell-Cell communication|Junction|Adhesion|Regulation", pathway, ignore.case = TRUE) ~ "Cell-Cell communication",
+
+    TRUE ~ "Other"
+  ))
+
   pathways <- pathways %>%
     mutate(pathway_subcategory = case_when(
       grepl("Inflam", pathway, ignore.case = TRUE) ~ "Inflammatory Response",
@@ -829,6 +628,8 @@ addPathwayCategory <- function(pathways){
       grepl("Immun", pathway_category, ignore.case = TRUE) ~ "Immune System",
       TRUE ~ "Other"
     ))
+  
+  return(pathways)
 }
 
 preparePathwayData <- function(pathways, group, n_top, n_tail, per_cluster){
@@ -948,6 +749,11 @@ segregateIntoSeveralColumns <- function(pathways, facetParam, n_columns){
   #' This is useful for visualizations where you want to split a large number of facet levels into several columns, 
   #' ensuring that the columns are balanced in size for better plot aesthetics.
   
+  # 0. Delete the Column variable if already exists
+  pathways <- pathways %>% dplyr::select(any_of(
+    colnames(pathways)[!grepl("Column", colnames(pathways))]
+  ))
+  
   # 1. Select the unique values for facetParam field
   xi <- unique(pathways %>% dplyr::select(!!sym(facetParam)) %>% arrange(!!sym(facetParam)))
   
@@ -987,7 +793,7 @@ segregateIntoSeveralColumns <- function(pathways, facetParam, n_columns){
   return(pathways)
 }
 
-complete_DE_results <- function(current_de_results, group1, group2, subset_var, subset_value, cluster = NULL, clust_res = NULL) {
+complete_DE_results <- function(current_de_results, group1, group2, subset_var = NULL, subset_value = NULL, cluster = NULL, clust_res = NULL) {
   
   ## Completes the results DF with metadata columns
   ## This is for any comparability so the subset parameter is passed in subset_var
@@ -1006,7 +812,7 @@ complete_DE_results <- function(current_de_results, group1, group2, subset_var, 
   current_de_results[["group1"]] <- group1
   current_de_results[["group2"]] <- group2
   current_de_results[subset_var] <- subset_value
-  current_de_results[["group"]] <- paste0(current_de_results[["group1"]], "-", current_de_results[["group2"]])
+  current_de_results[["group"]] <- paste0(current_de_results[["group2"]], "_vs_", current_de_results[["group1"]])
   
   if (!is.null(cluster) && !is.null(clust_res)) {
     current_de_results[["cluster"]] <- cluster
